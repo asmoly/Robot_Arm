@@ -1,11 +1,19 @@
 import pyzed.sl as sl
 import cv2
+import math
 import numpy as np
 import mediapipe as mp
 
 from arm_controls import *
 
 CAMERA_DIM = (1280, 720)
+FOCAL_LENGTH_HD720 = 736
+
+# Center coordinates from x (0 - 1), y (1 - 0) to pixels centered in the center of the screen
+def center_coord(x, y):
+    x_converted = (x - 0.5)*CAMERA_DIM[0]
+    y_converted = ((1 - y) - 0.5)*CAMERA_DIM[1]
+    return int(x_converted), int(y_converted)
 
 def main():
     zed = sl.Camera()
@@ -51,23 +59,40 @@ def main():
                     )
 
                     wrist = hand_landmarks.landmark[0]
-                    x, y = wrist.x, wrist.y
+                    wrist_depth_coord_x, wrist_depth_coord_y = int(wrist.x*CAMERA_DIM[0]), int(wrist.y*CAMERA_DIM[1])
+                    wrist_x, wrist_y = center_coord(wrist.x, wrist.y)
 
-                    if x >= 0 and x < 1 and y >= 0 and y < 1:
-                        depth = depth_image_ocv[int((y)*CAMERA_DIM[1])][int((x)*CAMERA_DIM[0])]
+                    pointer_finger = hand_landmarks.landmark[8]
+                    pointer_x, pointer_y = center_coord(pointer_finger.x, pointer_finger.y)
+
+                    thumb_finger = hand_landmarks.landmark[4]
+                    thumb_x, thumb_y = center_coord(thumb_finger.x, thumb_finger.y)
+
+                    if wrist_depth_coord_x >= 0 and wrist_depth_coord_x < CAMERA_DIM[0] and wrist_depth_coord_y >= 0 and wrist_depth_coord_y < CAMERA_DIM[1]:
+                        depth = depth_image_ocv[wrist_depth_coord_y][wrist_depth_coord_x]
 
                         if depth != 0:
                             # mm to m
-                            depth = 0.7 - (depth/10000)*5
+                            depth = (depth/1000)
 
-                            target_position = [x - 0.5, 0.7 - y, -depth]
+                            wrist_pos_world = [depth*wrist_x/FOCAL_LENGTH_HD720, depth*wrist_y/FOCAL_LENGTH_HD720, -depth]
+                            pointer_pos_world = [depth*pointer_x/FOCAL_LENGTH_HD720, depth*pointer_y/FOCAL_LENGTH_HD720, -depth]
+                            thumb_pos_world = [depth*thumb_x/FOCAL_LENGTH_HD720, depth*thumb_y/FOCAL_LENGTH_HD720, -depth]
 
-                            target_position[0] = round(target_position[0]*0.6, 2)
-                            target_position[1] = round(target_position[1]*0.6, 2)
-                            target_position[2] = round(target_position[2]*1.0, 2)
-                            
-                            print(f'Index Finger Tip - X: {target_position[0]:.4f}, Y: {target_position[1]:.4f}, Z: {target_position[2]:.4f}')
-                            arm.iterate_inverse_kinematics(target_position)
+                            # Distance from pointer finger to thumb in meters
+                            pointer_to_thumb_distance = math.sqrt((pointer_pos_world[0] - thumb_pos_world[0])**2 + (pointer_pos_world[1] - thumb_pos_world[1])**2)
+                            #print(pointer_to_thumb_distance)
+
+                            gripper_angle = 150
+                            if pointer_to_thumb_distance <= 0.03:
+                                gripper_angle = 200
+                                print("Closed")
+
+                            target_position = [wrist_pos_world[0], wrist_pos_world[1], -(2 - abs(wrist_pos_world[2]))]
+                            arm.iterate_inverse_kinematics(target_position, gripper_angle=gripper_angle)
+            else:
+                #arm.reset_all_joints()
+                pass
 
             cv2.imshow("Normal View", image_ocv)
 

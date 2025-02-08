@@ -21,7 +21,7 @@ class Arm_Controller:
         self.ang_b = torch.tensor(0.0, requires_grad=True)
         self.ang_c = torch.tensor(0.0, requires_grad=True)
 
-        self.learning_rate = 1
+        self.learning_rate = 0.8
         self.optimizer = torch.optim.SGD([self.ang_a, self.ang_b, self.ang_c], lr=self.learning_rate)
 
     # Degrees
@@ -45,8 +45,8 @@ class Arm_Controller:
             print("ERROR: FAILED TO SEND DIRECTIONS TO ARM")
 
     # Degrees
-    def rotate_all_joints(self, base_angle, shoulder_angle, elbow_angle):
-        command = '{"T":122,"b":' + str(int(base_angle)) + ',"s":' + str(int(shoulder_angle)) + ',"e":' + str(int(elbow_angle)) + ',"h":' + str(180) + ',"spd":' + str(self.speed) + ',"acc":' + str(self.speed) + '}'
+    def rotate_all_joints(self, base_angle, shoulder_angle, elbow_angle, gripper_angle=62):
+        command = '{"T":122,"b":' + str(int(base_angle)) + ',"s":' + str(int(shoulder_angle)) + ',"e":' + str(int(elbow_angle)) + ',"h":' + str(int(gripper_angle)) + ',"spd":' + str(self.speed) + ',"acc":' + str(self.speed) + '}'
         try:
             self.ser.write(command.encode() + b'\n')
             self.joint_angles = [base_angle, shoulder_angle, elbow_angle]
@@ -106,7 +106,7 @@ class Arm_Controller:
        # print(self.joint_angles)
         #print(ang_a, ang_b, ang_c)
 
-    def iterate_inverse_kinematics(self, position):
+    def iterate_inverse_kinematics(self, position, gripper_angle=62):
         target_position = torch.Tensor(position)
 
         self.optimizer.zero_grad()
@@ -129,17 +129,11 @@ class Arm_Controller:
 
         arm_coords = arm_a_vec + arm_b_vec
 
-        # x_pos = (-torch.sin(self.ang_a)*(-torch.sin(self.ang_b)*self.arm_lengths[0][0] + torch.cos(self.ang_b)*(-self.arm_lengths[0][1]))) + (-torch.sin(self.ang_a)*(-torch.sin(self.ang_b + self.ang_c)*self.arm_lengths[1]))
-        # y_pos = (torch.cos(self.ang_b)*self.arm_lengths[0][0] + torch.sin(self.ang_b)*(-self.arm_lengths[0][1])) + (torch.cos(-self.ang_b - self.ang_c)*self.arm_lengths[1])
-        # z_pos = (torch.cos(self.ang_a)*(-torch.sin(self.ang_b)*self.arm_lengths[0][0] + torch.cos(self.ang_b)*(-self.arm_lengths[0][1]))) + (torch.cos(self.ang_a)*(-torch.sin(self.ang_b + self.ang_c)*self.arm_lengths[1]))
-
-        #print(target_position, x_pos, y_pos, z_pos)
-
         loss = (target_position[0] - arm_coords[0])**2 + (target_position[1] - arm_coords[1])**2 + (target_position[2] - arm_coords[2])**2
         loss.backward()
         self.optimizer.step()
 
-        self.rotate_all_joints(self.ang_a.item()*180/pi, self.ang_b.item()*180/pi, self.ang_c.item()*180/pi)
+        self.rotate_all_joints(self.ang_a.item()*180/pi, self.ang_b.item()*180/pi, self.ang_c.item()*180/pi, gripper_angle=gripper_angle)
         self.joint_angles = [self.ang_a.item()*180/pi, self.ang_b.item()*180/pi, self.ang_c.item()*180/pi]
 
     def close_serial_port(self):
