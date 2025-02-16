@@ -64,7 +64,7 @@ class Arm_Controller:
         arm_b_vec = Vector(0, self.arm_lengths[1], 0)
         arm_b_vec = Matrix.get_rot_mat(0, -self.joint_angles[0], 0)*Matrix.get_rot_mat(-self.joint_angles[1] - self.joint_angles[2], 0, 0)*arm_b_vec
 
-        return arm_a_vec+arm_b_vec
+        return arm_a_vec + arm_b_vec
 
     def move_arm_to_pos(self, position, loop_iterations=100):
         target_position = torch.Tensor(position)
