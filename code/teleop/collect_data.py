@@ -166,11 +166,12 @@ def main():
             # cv2.imshow("depth View", depth_image_rs)
             # cv2.imshow("Color View", color_image_rs)
 
+            #print(arm.joint_angles, gripper_state)
             if (time.time() - old_time) >= 1.0/RECORDING_FPS and collecting_data == True:
                 threading.Thread(target=data_writer_thread, args=(depth_image_rs, color_image_rs, arm.joint_angles, gripper_state, episode_image_counter)).start()
                 episode_image_counter += 1
 
-            height = 200
+            height = 300
             image_ocv = cv2.resize(image_ocv, (int(image_ocv.shape[1]*height/image_ocv.shape[0]), height))
             depth_image_normalized_rs = cv2.resize(depth_image_normalized_rs, (int(depth_image_normalized_rs.shape[1]*height/depth_image_normalized_rs.shape[0]), height))
             color_image_rs = cv2.resize(color_image_rs, (int(color_image_rs.shape[1]*height/color_image_rs.shape[0]), height))
