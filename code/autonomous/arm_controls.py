@@ -3,9 +3,6 @@ import serial
 
 from matrix import *
 
-def clamp(n, smallest, largest):
-    return max(smallest, min(n, largest))
-
 class Arm_Controller:
     def __init__(self, port="COM7", speed=0, acceleration=1, arm_lengths=[[0.23682, 0.03], 0.28015], default_joint_angles=[0, 0, 90]) -> None:
         self.joint_angles = [0, 0, 0] # degrees
@@ -23,6 +20,8 @@ class Arm_Controller:
         self.ang_a = torch.tensor(0.0, requires_grad=True)
         self.ang_b = torch.tensor(0.0, requires_grad=True)
         self.ang_c = torch.tensor(0.0, requires_grad=True)
+
+        self.gripper_state = 0
 
         self.learning_rate = 0.8
         self.optimizer = torch.optim.SGD([self.ang_a, self.ang_b, self.ang_c], lr=self.learning_rate)
@@ -48,7 +47,13 @@ class Arm_Controller:
             print("ERROR: FAILED TO SEND DIRECTIONS TO ARM")
 
     # Degrees
-    def rotate_all_joints(self, base_angle, shoulder_angle, elbow_angle, gripper_angle=62):
+    def rotate_all_joints(self, base_angle, shoulder_angle, elbow_angle, gripper_state=0):
+        gripper_angle = 150
+        self.gripper_state = 1
+        if gripper_state == 0:
+            gripper_angle = 200
+            self.gripper_state = 0
+        
         command = '{"T":122,"b":' + str(int(base_angle)) + ',"s":' + str(int(shoulder_angle)) + ',"e":' + str(int(elbow_angle)) + ',"h":' + str(int(gripper_angle)) + ',"spd":' + str(self.speed) + ',"acc":' + str(self.speed) + '}'
         try:
             self.ser.write(command.encode() + b'\n')
@@ -135,10 +140,6 @@ class Arm_Controller:
         loss = (target_position[0] - arm_coords[0])**2 + (target_position[1] - arm_coords[1])**2 + (target_position[2] - arm_coords[2])**2
         loss.backward()
         self.optimizer.step()
-
-        # self.ang_a = clamp(self.ang_a, -45, 45)
-        # self.ang_b = clamp(self.ang_b, -20, 80)
-        # self.ang_b = clamp(self.ang_c, 0, 170)
 
         self.rotate_all_joints(self.ang_a.item()*180/pi, self.ang_b.item()*180/pi, self.ang_c.item()*180/pi, gripper_angle=gripper_angle)
         self.joint_angles = [self.ang_a.item()*180/pi, self.ang_b.item()*180/pi, self.ang_c.item()*180/pi]

@@ -1,301 +1,182 @@
 import os
+import datetime
+
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
-from torch.optim import Adam
-from torchvision.datasets.mnist import MNIST
+from torch.optim import AdamW
+import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
-from torch.utils.data import DataLoader, Dataset
+
 import numpy as np
-import pickle
 import cv2
+from math import cos, sin, pi
+from matrix import *
 
-class PatchEmbedding(nn.Module):
-    def __init__(self, d_model, img_size, patch_size, n_channels):
-        super().__init__()
+from torch.utils.tensorboard import SummaryWriter
 
-        self.d_model = d_model # Dimensionality of Model
-        self.img_size = img_size # Image Size
-        self.patch_size = patch_size # Patch Size
-        self.n_channels = n_channels # Number of Channels
+from arm_dataset import *
+from arm_models import *
 
-        self.linear_project = nn.Conv2d(self.n_channels, self.d_model, kernel_size=self.patch_size, stride=self.patch_size)
-
-    # B: Batch Size
-    # C: Image Channels
-    # H: Image Height
-    # W: Image Width
-    # P_col: Patch Column
-    # P_row: Patch Row
-    def forward(self, x):
-        x = self.linear_project(x) # (B, C, H, W) -> (B, d_model, P_col, P_row)
-        x = x.flatten(2) # (B, d_model, P_col, P_row) -> (B, d_model, P)
-        x = x.transpose(1, 2) # (B, d_model, P) -> (B, P, d_model)
-        return x
-
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_seq_length):
-        super().__init__()
-
-        self.pred_pose_token = nn.Parameter(torch.randn(1, 1, d_model)) # pose prediction token
-        self.current_pose_token = torch.Tensor((1, 1, d_model)) # pose prediction token
-        
-        # Creating positional encoding
-        pe = torch.zeros(max_seq_length, d_model)
-
-        for pos in range(max_seq_length):
-            for i in range(d_model):
-                if i % 2 == 0:
-                    pe[pos][i] = np.sin(pos/(10000 ** (i/d_model)))
-                else:
-                    pe[pos][i] = np.cos(pos/(10000 ** ((i-1)/d_model)))
-
-        self.register_buffer('pe', pe.unsqueeze(0))
-
-    def forward(self, x):
-        # Expand to have class token for every image in batch
-        tokens_batch = self.pred_pose_token.expand(x.size()[0], -1, -1)
-
-        # Adding class tokens to the beginning of each embedding
-        x = torch.cat((tokens_batch,x), dim=1)
-
-        # Add positional encoding to embeddings
-        x = x + self.pe
-
-        return x
-
-
-class AttentionHead(nn.Module):
-    def __init__(self, d_model, head_size):
-        super().__init__()
-        self.head_size = head_size
-
-        self.query = nn.Linear(d_model, head_size)
-        self.key = nn.Linear(d_model, head_size)
-        self.value = nn.Linear(d_model, head_size)
-
-    def forward(self, x):
-        # Obtaining Queries, Keys, and Values
-        Q = self.query(x)
-        K = self.key(x)
-        V = self.value(x)
-
-        # Dot Product of Queries and Keys
-        attention = Q @ K.transpose(-2,-1)
-
-        # Scaling
-        attention = attention / (self.head_size ** 0.5)
-
-        attention = torch.softmax(attention, dim=-1)
-
-        attention = attention @ V
-
-        return attention
-
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, n_heads):
-        super().__init__()
-        self.head_size = d_model // n_heads
-
-        self.W_o = nn.Linear(d_model, d_model)
-
-        self.heads = nn.ModuleList([AttentionHead(d_model, self.head_size) for _ in range(n_heads)])
-
-    def forward(self, x):
-        # Combine attention heads
-        out = torch.cat([head(x) for head in self.heads], dim=-1)
-
-        out = self.W_o(out)
-
-        return out
-  
-
-class TransformerEncoder(nn.Module):
-    def __init__(self, d_model, n_heads, r_mlp=4):
-        super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-
-        # Sub-Layer 1 Normalization
-        self.ln1 = nn.LayerNorm(d_model)
-
-        # Multi-Head Attention
-        self.mha = MultiHeadAttention(d_model, n_heads)
-
-        # Sub-Layer 2 Normalization
-        self.ln2 = nn.LayerNorm(d_model)
-
-        # Multilayer Perception
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, d_model*r_mlp),
-            nn.GELU(),
-            nn.Linear(d_model*r_mlp, d_model)
-        )
-
-    def forward(self, x):
-        # Residual Connection After Sub-Layer 1
-        out = x + self.mha(self.ln1(x))
-
-        # Residual Connection After Sub-Layer 2
-        out = out + self.mlp(self.ln2(out))
-
-        return out
-
-
-class VisionTransformer(nn.Module):
-    def __init__(self, d_model, img_size, patch_size, n_channels, n_heads, n_layers):
-        super().__init__()
-
-        assert img_size[0] % patch_size[0] == 0 and img_size[1] % patch_size[1] == 0, "img_size dimensions must be divisible by patch_size dimensions"
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-
-        self.d_model = d_model # Dimensionality of model
-        self.img_size = img_size # Image size
-        self.patch_size = patch_size # Patch size
-        self.n_channels = n_channels # Number of channels
-        self.n_heads = n_heads # Number of attention heads
-
-        self.n_patches = (self.img_size[0] * self.img_size[1]) // (self.patch_size[0] * self.patch_size[1])
-        self.max_seq_length = self.n_patches + 1
-
-        self.patch_embedding = PatchEmbedding(self.d_model, self.img_size, self.patch_size, self.n_channels)
-        self.positional_encoding = PositionalEncoding( self.d_model, self.max_seq_length)
-        self.transformer_encoder = nn.Sequential(*[TransformerEncoder( self.d_model, self.n_heads) for _ in range(n_layers)])
-
-        # Input pose mapper
-        self.pose_to_token = nn.Sequential(
-            nn.Linear(4, self.d_model), # 4 is the number of joint angles on the arm
-        )
-
-        # Pose predictor MLP
-        self.pose_predictor = nn.Sequential(
-            nn.Linear(self.d_model, 4), # 4 is the number of joint angles on the arm
-        )
-
-    def forward(self, images, current_poses):
-        x = self.patch_embedding(images)
-
-        # create tokens from current_poses and concatenate them to x
-        # create random init tokens for pred_poses and concatenate them to x
-
-        x = self.positional_encoding(x)
-        
-        x = self.transformer_encoder(x)
-        
-        x = self.pose_predictor(x[:,0])
-
-        return x
-    
-class ArmEpisodeDataset(Dataset):
-    def __init__(self, path_to_data, image_transform=None):
-        self.path_to_data = path_to_data
-        self.image_transform = image_transform
-
-        print(f"Loading data from {self.path_to_data}")
-        self.episodes = []
-        for episode in os.listdir(self.path_to_data):
-            episode_length = len([f for f in os.listdir(os.path.join(self.path_to_data, episode, "color_images")) if os.path.isfile(os.path.join(os.path.join(self.path_to_data, episode, "color_images"), f))])
-            self.episodes.append([episode, episode_length])
-
-        self.data_length = 0
-        for episode in self.episodes:
-            self.data_length += (episode[1] - 1) # We dont take into account the last frame as there is nothing after it
-
-        print(f"Finished loading data from {self.path_to_data}")
-
-    def __len__(self):
-        return self.data_length
-
-    def __getitem__(self, idx):
-        frame_count = 0
-        for episode in self.episodes:
-            if idx <= (frame_count + episode[1] - 1):
-                print(os.path.join(self.path_to_data, episode[0], "color_images", f"{str(idx - frame_count)}.png"))
-                color_image = cv2.imread(os.path.join(self.path_to_data, episode[0], "color_images", f"{str(idx - frame_count)}.png"))
-                depth_image = cv2.imread(os.path.join(self.path_to_data, episode[0], "depth_images", f"{str(idx - frame_count)}.png"))
-                current_arm_position = pickle.load(open(os.path.join(self.path_to_data, episode[0], "arm_positions", str(idx - frame_count)), "rb"))
-                future_arm_position = pickle.load(open(os.path.join(self.path_to_data, episode[0], "arm_positions", str(idx - frame_count + 1)), "rb")) # +1 because it is the next position
-                
-                color_image = torch.Tensor(color_image)
-                if self.image_transform != None:
-                    color_image = self.image_transform(torch.Tensor(color_image))
-
-                depth_image = torch.Tensor(depth_image)
-
-                image = torch.zeros((480, 848, 4))
-                image[:, :, :3] = color_image
-                image[:, :, 3] = depth_image
-                
-                current_arm_position = torch.Tensor([current_arm_position[0][0], current_arm_position[0][1], current_arm_position[0][2], current_arm_position[1]])
-                future_arm_position = torch.Tensor([future_arm_position[0][0], future_arm_position[0][1], future_arm_position[0][2], future_arm_position[1]])
-
-                return image, current_arm_position, future_arm_position
-            
-            frame_count += (episode[1] - 1)
-  
-d_model = 9
-img_size = (848, 480)
-patch_size = (16, 16)
+d_model = 16
+img_size = (424, 240)
+patch_size = (8, 8)
 n_channels = 4
-n_heads = 3
-n_layers = 3
-epochs = 5
-alpha = 0.005
+n_heads = 4
+n_sa_blocks = 8
+start_epoch = 44
+n_epochs = 100
+learning_rate = 0.001 # 0.005 -- works
+val_every_n_epoch = 3
+log_every_n_batches = 10
+dataset_delta_frame = 10
 
-train_batch_size = 10
+train_batch_size = 20
 test_batch_size = 1
 
 PATH_TO_TRAIN_DATA = "data/train"
 PATH_TO_TEST_DATA = "data/test"
-
-train_dataset = ArmEpisodeDataset(PATH_TO_TRAIN_DATA)
-test_dataset = ArmEpisodeDataset(PATH_TO_TEST_DATA)
-
-train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=train_batch_size)
-test_dataloader = DataLoader(test_dataset, shuffle=True, batch_size=test_batch_size)
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device: ", device, f"({torch.cuda.get_device_name(device)})" if torch.cuda.is_available() else "")
-
-transformer = VisionTransformer(d_model, img_size, patch_size, n_channels, n_heads, n_layers).to(device)
-
-optimizer = Adam(transformer.parameters(), lr=alpha)
-criterion = nn.L1Loss()
-
-print("-- Starting training --")
-for epoch in range(epochs):
-    training_loss = 0.0
-
-    for i, data in enumerate(train_dataloader, 0):
-        image, current_arm_pos, future_arm_pos = data
-        image, current_arm_pos, future_arm_pos = image.to(device), current_arm_pos.to(device), future_arm_pos.to(device)
-
-        optimizer.zero_grad()
-
-        outputs = transformer(image)
-        loss = criterion(outputs, future_arm_pos)
-        loss.backward()
-        optimizer.step()
-
-        training_loss += loss.item()
-
-    print(f'Epoch {epoch + 1}/{epochs} loss: {training_loss  / len(train_loader) :.3f}')
+PATH_TO_LOGS = "logs/run"
+PATH_TO_MODEL = "logs/run_20250301_231222/armnet_43.pt"
 
 
-correct = 0
-total = 0
+def draw_arm_pose(top_down_image, side_view_image, arm_pose, color, arm_lengths=[[0.23682, 0.03], 0.28015], width=3, scale=500):
+    pose_rad = [arm_pose[0]*pi/180, pi/2 - arm_pose[1]*pi/180, -1*(arm_pose[2]*pi/180 - pi/2)] # Converting units to radians and correct angles
 
-with torch.no_grad():
-    for data in test_loader:
-        images, labels = data
-        images, labels = images.to(device), labels.to(device)
+    top_down_vecs = [Vector(0, cos(pose_rad[1])*arm_lengths[0][0]*scale), Vector(0, cos(pose_rad[1] - pi/2 + pose_rad[2])*arm_lengths[1]*scale)]
+    rotation_mat = Matrix.generate_rotation_matrix(arm_pose[0])
+    
+    top_down_vecs[1] = top_down_vecs[1] + top_down_vecs[0]
+    top_down_vecs[1] = rotation_mat*top_down_vecs[1]
+    top_down_vecs[0] = rotation_mat*top_down_vecs[0]
+    top_down_vecs[1] = top_down_vecs[1] - top_down_vecs[0]
 
-        outputs = transformer(images)
+    cv2.line(top_down_image, (int(top_down_image.shape[1]/2), int(top_down_image.shape[0] - 1)), (int(top_down_vecs[0].x + top_down_image.shape[1]/2), int(top_down_image.shape[0] - 1 - top_down_vecs[0].y)), (0.7*color[0], 0.7*color[1], 0.7*color[2]), width)
+    cv2.line(top_down_image, (int(top_down_vecs[0].x) + int(top_down_image.shape[1]/2), int(top_down_image.shape[0] - 1 - top_down_vecs[0].y)), (int(top_down_vecs[0].x + top_down_image.shape[1]/2 + top_down_vecs[1].x), int(top_down_image.shape[0] - 1 - (top_down_vecs[0].y + top_down_vecs[1].y))), (0.5*color[0], 0.5*color[1], 0.5*color[2]), width)
+    cv2.circle(top_down_image, (int(top_down_vecs[0].x + top_down_image.shape[1]/2 + top_down_vecs[1].x), int(top_down_image.shape[0] - 1 - (top_down_vecs[0].y + top_down_vecs[1].y))), 3, (0, float(arm_pose[3]), 1 - float(arm_pose[3])), 2)
 
-        _, predicted = torch.max(outputs.data, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-        
-    print(f'\nModel Accuracy: {100 * correct // total} %')
+    side_vecs = [Vector(top_down_vecs[0].y, sin(pose_rad[1])*arm_lengths[0][0]*scale), Vector(top_down_vecs[1].y, sin(pose_rad[1] - pi/2 + pose_rad[2])*arm_lengths[1]*scale)]
+    cv2.line(side_view_image, (0, int(side_view_image.shape[0] - 100)), (int(side_vecs[0].x), int(side_view_image.shape[0] - side_vecs[0].y - 100)), (0.7*color[0], 0.7*color[1], 0.7*color[2]), width)
+    cv2.line(side_view_image, (int(side_vecs[0].x), int(side_view_image.shape[0] - side_vecs[0].y - 100)), (int(side_vecs[0].x + side_vecs[1].x), int(side_view_image.shape[0] - (side_vecs[0].y + side_vecs[1].y) - 100)), (0.5*color[0], 0.5*color[1], 0.5*color[2]), width)
+    cv2.circle(side_view_image, (int(side_vecs[0].x + side_vecs[1].x), int(side_view_image.shape[0] - (side_vecs[0].y + side_vecs[1].y) - 100)), 3, (0, float(arm_pose[3]), 1 - float(arm_pose[3])), 2)
+
+    return top_down_image, side_view_image
+
+
+def load_model(path):
+    model = ArmTransformer(d_model, img_size, patch_size, n_channels, n_heads, n_sa_blocks)
+    model.load_state_dict(torch.load(path))
+    model.eval()
+
+    return model
+
+
+# Main function
+def main():
+    # Create new log directory
+    now = datetime.datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    log_path = f"{PATH_TO_LOGS}_{timestamp}"
+    writer = SummaryWriter(log_dir=log_path)
+
+    # Create datasets
+    train_dataset = ArmEpisodeDataset(PATH_TO_TRAIN_DATA, delta_frame=dataset_delta_frame, image_transform=dataTransformations)
+    test_dataset = ArmEpisodeDataset(PATH_TO_TEST_DATA, delta_frame=dataset_delta_frame, image_transform=dataTransformations)
+    train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=train_batch_size)
+    test_dataloader = DataLoader(test_dataset, shuffle=True, batch_size=test_batch_size)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device: ", device, f"({torch.cuda.get_device_name(device)})" if torch.cuda.is_available() else "")
+
+    # Create arm model
+    arm_transformer_model = ArmTransformer(d_model, img_size, patch_size, n_channels, n_heads, n_sa_blocks).to(device)
+    if PATH_TO_MODEL != None :
+        arm_transformer_model = load_model(PATH_TO_MODEL).to(device)
+
+    optimizer = AdamW(arm_transformer_model.parameters(), lr=learning_rate)
+    criterion = nn.L1Loss(reduction='mean')
+
+    # Train
+    print("-- Starting training --")
+    
+    total_samples = 0
+    iter_to_log = total_samples
+    for epoch in range(start_epoch, n_epochs):
+        arm_transformer_model.train()
+        training_loss = 0.0
+
+        for i, data in enumerate(train_dataloader, 0):
+            images, current_poses, future_poses = data
+            images, current_poses, future_poses = images.to(device), current_poses.to(device), future_poses.to(device)
+
+            optimizer.zero_grad()
+
+            outputs = arm_transformer_model(images, current_poses)
+            loss = criterion(outputs, future_poses)
+            loss.backward()
+            optimizer.step()
+
+            training_loss += loss.item()
+
+            if i % log_every_n_batches == 0:
+                iter_to_log = total_samples
+
+                # Log losses
+                loss_to_log = training_loss/log_every_n_batches
+                training_loss = 0.0
+                writer.add_scalar("Loss", loss_to_log, total_samples)
+                print(f"Training Loss: {loss_to_log}")
+
+                # Log data
+                image = images[0].detach().cpu().numpy()
+                current_pose = current_poses[0].cpu()
+                future_pose = future_poses[0].cpu()
+                predicted_pose = outputs[0].cpu()
+
+                current_pose[:3] = current_pose[:3]*180.0
+                future_pose[:3] = future_pose[:3]*180.0
+                predicted_pose[:3] = predicted_pose[:3]*180.0
+
+                side_view = np.zeros((500, 500, 3))
+                top_view = np.zeros((500, 500, 3))
+                draw_arm_pose(top_view, side_view, current_pose, (1, 1, 1), width=12)
+                draw_arm_pose(top_view, side_view, future_pose, (0, 1, 0), width=7)
+                draw_arm_pose(top_view, side_view, predicted_pose, (1, 0, 0), width=3)
+
+                writer.add_image("side view", transforms.ToTensor()(side_view), iter_to_log)
+                writer.add_image("top view", transforms.ToTensor()(top_view), iter_to_log)
+                writer.add_image("color", image[:3, :, :], iter_to_log)
+                writer.add_image("depth", image[3, None, :, :], iter_to_log)
+                writer.flush()
+
+            total_samples += train_batch_size
+
+        # Save the model checkpoint for this epoch
+        print(f'Epoch {epoch}/{n_epochs}')
+        torch.save(arm_transformer_model.state_dict(), os.path.join(log_path, f"armnet_{epoch}.pt")) 
+
+        # Validate 
+        if epoch % val_every_n_epoch == 0:
+            arm_transformer_model.eval()  # Set the model to evaluation mode
+            val_total_loss = 0.0
+
+            with torch.no_grad():   # Disable gradient calculation
+                
+                for data in test_dataloader:
+                    images, current_poses, future_poses = data
+                    images, current_poses, future_poses = images.to(device), current_poses.to(device), future_poses.to(device)
+
+                    outputs = arm_transformer_model(images, current_poses)
+                    loss = criterion(outputs, future_poses)
+                    val_total_loss += loss.item()
+
+                validation_loss = val_total_loss / len(test_dataloader)
+                print(f"Validation Loss: {validation_loss}")
+                writer.add_scalar("Validation Loss", validation_loss, iter_to_log)
+
+
+# __name__
+if __name__=="__main__":
+    main()
+
+

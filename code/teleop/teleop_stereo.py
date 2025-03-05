@@ -88,8 +88,9 @@ def main():
                                 gripper_angle = 200
                                 print("Closed")
 
-                            target_position = [wrist_pos_world[0], wrist_pos_world[1], -(2 - abs(wrist_pos_world[2]))]
+                            target_position = [wrist_pos_world[0], wrist_pos_world[1], -(1.8 - abs(wrist_pos_world[2]))]
                             arm.iterate_inverse_kinematics(target_position, gripper_angle=gripper_angle)
+                            print(arm.joint_angles)
             else:
                 #arm.reset_all_joints()
                 pass
